@@ -31,6 +31,7 @@ def init_db() -> None:
             CREATE TABLE IF NOT EXISTS tasks (
               id TEXT PRIMARY KEY,
               url TEXT NOT NULL,
+              title TEXT,
               status TEXT NOT NULL,
               current_stage TEXT,
               session_path TEXT,
@@ -72,6 +73,26 @@ def init_db() -> None:
                 "INSERT OR IGNORE INTO settings (key, value, updated_at) VALUES (?, ?, ?)",
                 (f"ytdlp.{key}", value, now_iso()),
             )
+        existing_columns = {row["name"] for row in conn.execute("PRAGMA table_info(tasks)").fetchall()}
+        if "title" not in existing_columns:
+            conn.execute("ALTER TABLE tasks ADD COLUMN title TEXT")
+
+
+def backfill_titles_from_metadata() -> None:
+    import json
+    with connect() as conn:
+        rows = conn.execute(
+            "SELECT id, session_path FROM tasks WHERE (title IS NULL OR title = '') AND session_path IS NOT NULL"
+        ).fetchall()
+    for row in rows:
+        info_path = Path(row["session_path"]) / "metadata" / "ytdlp_info.json"
+        if not info_path.exists():
+            continue
+        title = (json.loads(info_path.read_text(encoding="utf-8")).get("title") or "").strip()
+        if not title:
+            continue
+        with connect() as conn:
+            conn.execute("UPDATE tasks SET title = ? WHERE id = ?", (title, row["id"]))
 
 
 def fail_stale_active_tasks() -> None:
@@ -102,8 +123,8 @@ def fail_stale_active_tasks() -> None:
                 )
 
 
-def create_task(url: str) -> str:
-    task_id = str(uuid.uuid4())
+def create_task(url: str, task_id: str | None = None) -> str:
+    new_id = task_id or str(uuid.uuid4())
     created_at = now_iso()
     with connect() as conn:
         conn.execute(
@@ -111,16 +132,26 @@ def create_task(url: str) -> str:
             INSERT INTO tasks (id, url, status, current_stage, created_at)
             VALUES (?, ?, 'queued', ?, ?)
             """,
-            (task_id, url, STAGES[0].name, created_at),
+            (new_id, url, STAGES[0].name, created_at),
         )
         conn.executemany(
             """
             INSERT INTO task_stages (task_id, name, label, status)
             VALUES (?, ?, ?, 'pending')
             """,
-            [(task_id, stage.name, stage.label) for stage in STAGES],
+            [(new_id, stage.name, stage.label) for stage in STAGES],
         )
-    return task_id
+    return new_id
+
+
+def find_task_by_video_id(video_id: str) -> str | None:
+    with connect() as conn:
+        row = conn.execute(
+            "SELECT id FROM tasks WHERE id = ? OR url LIKE ? "
+            "ORDER BY created_at DESC, rowid DESC LIMIT 1",
+            (video_id, f"%{video_id}%"),
+        ).fetchone()
+    return row["id"] if row else None
 
 
 def has_active_task() -> bool:
@@ -134,8 +165,19 @@ def has_active_task() -> bool:
 
 def latest_task_id() -> str | None:
     with connect() as conn:
-        row = conn.execute("SELECT id FROM tasks ORDER BY created_at DESC LIMIT 1").fetchone()
+        row = conn.execute("SELECT id FROM tasks ORDER BY created_at DESC, rowid DESC LIMIT 1").fetchone()
     return row["id"] if row else None
+
+
+def list_tasks(limit: int = 100) -> list[dict[str, Any]]:
+    with connect() as conn:
+        rows = conn.execute(
+            "SELECT id, url, title, status, current_stage, final_video_path, error_message, "
+            "created_at, started_at, completed_at FROM tasks "
+            "ORDER BY created_at DESC, rowid DESC LIMIT ?",
+            (limit,),
+        ).fetchall()
+    return [dict(row) for row in rows]
 
 
 def get_task(task_id: str) -> dict[str, Any] | None:
@@ -152,11 +194,12 @@ def get_task(task_id: str) -> dict[str, Any] | None:
                 WHEN 'download' THEN 1
                 WHEN 'separate' THEN 2
                 WHEN 'asr' THEN 3
-                WHEN 'translate' THEN 4
-                WHEN 'split_audio' THEN 5
-                WHEN 'tts' THEN 6
-                WHEN 'merge_audio' THEN 7
-                WHEN 'merge_video' THEN 8
+                WHEN 'asr_fix' THEN 4
+                WHEN 'translate' THEN 5
+                WHEN 'split_audio' THEN 6
+                WHEN 'tts' THEN 7
+                WHEN 'merge_audio' THEN 8
+                WHEN 'merge_video' THEN 9
                 ELSE 99
               END
             """,
@@ -170,6 +213,35 @@ def get_task(task_id: str) -> dict[str, Any] | None:
 def get_current_task() -> dict[str, Any] | None:
     task_id = latest_task_id()
     return get_task(task_id) if task_id else None
+
+
+def delete_task(task_id: str) -> bool:
+    with connect() as conn:
+        cursor = conn.execute("DELETE FROM tasks WHERE id = ?", (task_id,))
+        conn.execute("DELETE FROM task_stages WHERE task_id = ?", (task_id,))
+        return cursor.rowcount > 0
+
+
+def reset_failed_for_resume(task_id: str) -> None:
+    with connect() as conn:
+        conn.execute(
+            """
+            UPDATE task_stages
+            SET status = 'pending', started_at = NULL, completed_at = NULL,
+                last_message = NULL, error_message = NULL
+            WHERE task_id = ? AND status IN ('failed', 'running')
+            """,
+            (task_id,),
+        )
+        conn.execute(
+            """
+            UPDATE tasks
+            SET status = 'queued', error_message = NULL, completed_at = NULL,
+                started_at = NULL
+            WHERE id = ?
+            """,
+            (task_id,),
+        )
 
 
 def update_task(task_id: str, **fields: Any) -> None:
@@ -214,15 +286,22 @@ def get_openai_settings() -> dict[str, str]:
         "base_url": get_setting("openai.base_url", defaults["base_url"]),
         "api_key": get_setting("openai.api_key", defaults["api_key"]),
         "model": get_setting("openai.model", defaults["model"]),
+        "translate_concurrency": get_setting(
+            "openai.translate_concurrency", defaults["translate_concurrency"]
+        ),
     }
 
 
-def save_openai_settings(base_url: str, api_key: str, model: str) -> None:
+def save_openai_settings(
+    base_url: str, api_key: str, model: str, translate_concurrency: str = ""
+) -> None:
     set_setting("openai.base_url", base_url.strip())
     cleaned_api_key = api_key.strip()
     if cleaned_api_key and set(cleaned_api_key) != {"*"}:
         set_setting("openai.api_key", cleaned_api_key)
     set_setting("openai.model", model.strip())
+    if translate_concurrency.strip():
+        set_setting("openai.translate_concurrency", translate_concurrency.strip())
 
 
 def get_ytdlp_settings() -> dict[str, str]:
