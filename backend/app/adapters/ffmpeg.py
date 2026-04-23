@@ -14,26 +14,28 @@ SUBTITLE_TAIL_BUFFER_MS = 100
 SUBTITLE_DURATION_FLOOR_MS = 600
 
 
-LANDSCAPE_SUBTITLE_STYLE = (
-    "FontName=Arial,"
-    "FontSize=24,"
-    "PrimaryColour=&H00FFFFFF,"
-    "OutlineColour=&H00000000,"
-    "BorderStyle=1,"
-    "Outline=2,"
-    "Alignment=2,"
-    "MarginV=5"
-)
-PORTRAIT_SUBTITLE_STYLE = (
-    "FontName=Arial,"
-    "FontSize=12,"
-    "PrimaryColour=&H00FFFFFF,"
-    "OutlineColour=&H00000000,"
-    "BorderStyle=1,"
-    "Outline=2,"
-    "Alignment=2,"
-    "MarginV=70"
-)
+SUBTITLE_FONTS = {
+    "zh": "Noto Sans CJK SC",
+    "en": "Arial",
+}
+
+SUBTITLE_FONT_SIZES = {
+    "zh": {"portrait": 12, "landscape": 24},
+    "en": {"portrait": 9, "landscape": 18},
+}
+
+
+def _subtitle_style(font: str, size: int, margin_v: int) -> str:
+    return (
+        f"FontName={font},"
+        f"FontSize={size},"
+        "PrimaryColour=&H00FFFFFF,"
+        "OutlineColour=&H00000000,"
+        "BorderStyle=1,"
+        "Outline=2,"
+        "Alignment=2,"
+        f"MarginV={margin_v}"
+    )
 
 
 def _srt_time(ms: int) -> str:
@@ -147,16 +149,30 @@ def _segment_times(item: dict) -> tuple[int, int]:
     return start, end
 
 
+def _dst_lang(translation: list[dict]) -> str:
+    for item in translation:
+        lang = item.get("dst_lang")
+        if lang:
+            return lang
+    return "zh"
+
+
+def _dst_text(item: dict) -> str:
+    return item.get("dst") or item.get("zh") or ""
+
+
 def write_srt(translation_file: Path, session: Path) -> Path:
-    output_file = session / "metadata" / "subtitles.zh.srt"
     data = json.loads(translation_file.read_text(encoding="utf-8"))
+    translation = data["translation"]
+    dst_lang = _dst_lang(translation)
+    output_file = session / "metadata" / f"subtitles.{dst_lang}.srt"
     lines: list[str] = []
     idx = 1
-    for item in data["translation"]:
+    for item in translation:
         start, end = _segment_times(item)
         if end <= start:
             continue
-        fragments = split_subtitle_text(item.get("zh") or "")
+        fragments = split_subtitle_text(_dst_text(item))
         if not fragments:
             continue
         cursor = start
@@ -208,14 +224,16 @@ def get_video_orientation(video_file: Path) -> str:
     return "portrait" if height > width else "landscape"
 
 
-def subtitle_style_for_orientation(orientation: str) -> str:
-    if orientation == "portrait":
-        return PORTRAIT_SUBTITLE_STYLE
-    return LANDSCAPE_SUBTITLE_STYLE
+def subtitle_style_for_orientation(orientation: str, font: str, lang: str = "zh") -> str:
+    sizes = SUBTITLE_FONT_SIZES.get(lang, SUBTITLE_FONT_SIZES["zh"])
+    margin_v = 70 if orientation == "portrait" else 5
+    return _subtitle_style(font, size=sizes[orientation], margin_v=margin_v)
 
 
 def subtitle_filter(video_file: Path, subtitle_file: Path) -> str:
-    style = subtitle_style_for_orientation(get_video_orientation(video_file))
+    lang = subtitle_file.stem.rsplit(".", 1)[-1]
+    font = SUBTITLE_FONTS.get(lang, "Arial")
+    style = subtitle_style_for_orientation(get_video_orientation(video_file), font, lang)
     sub_path = subtitle_file.as_posix()
     return f"subtitles=filename='{sub_path}':force_style='{style}'"
 
