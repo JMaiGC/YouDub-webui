@@ -224,6 +224,12 @@ npm --prefix apps/web run dev -- --hostname 0.0.0.0 --port 3000
 npm --prefix apps/web run dev -- --hostname 0.0.0.0 --port 3000
 ```
 
+前端默认通过同源 `/api/...` 请求访问后端，并由 Next.js 代理到 `http://127.0.0.1:8000`。如果后端不在本机 `8000` 端口，启动前端时设置 `NEXT_SERVER_API_BASE_URL`，例如：
+
+```bash
+NEXT_SERVER_API_BASE_URL=http://192.168.1.10:8000 npm --prefix apps/web run dev -- --hostname 0.0.0.0 --port 3000
+```
+
 打开：
 
 ```text
@@ -341,6 +347,10 @@ YouDub WebUI 仍然是 MVP，但已经可以支撑真实创作者的日常视频
 - 补充不同平台的运行说明。
 
 如果这个项目对你有帮助，欢迎 Star、Fork、提交 Issue 或 PR，也欢迎分享给关注 AI 视频本地化、开源工具和跨语言内容传播的人。
+
+## 开源许可
+
+本项目使用 Apache License 2.0，详见 [LICENSE](LICENSE)。
 
 ## Star History
 
